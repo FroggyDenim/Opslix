@@ -1,0 +1,1080 @@
+diff --git a/README.md b/README.md
+index 3d2fc07..7864450 100644
+--- a/README.md
++++ b/README.md
+@@ -61,6 +61,12 @@ The web version builds from the included C sources. Its first build downloads WA
+ 
+ The [per-track tuning API](app/instrument.h) supports custom tuning; a dedicated tuning editor is not included.
+ 
++## Operator waveforms (open web engine)
++
++The browser simulator's DX7 engine (`web/synth`) has an opsix-style per-operator waveform: sine (default, bit-exact with the original), triangle, saw, square, half-wave sine and full-wave sine. Set it with the `sim_op_wave(track, op, wave)` export (`op` 0-5 = panel OP1-OP6, `wave` 0-5, or -1 to read back). It is a live timbre control: it is not saved in projects and resets when the track's source is reset. Hard-edged waves are not band-limited and alias at high pitches. This is a web-simulator feature only; the device engine is the binary SDK and is unchanged.
++
++Run `tools/test_opwaves.sh` (clang and git on Linux/macOS) to check the waveforms, the bit-exact sine path against the original core, and the full simulator wiring.
++
+ ## License
+ 
+ APP: [GPLv3 with the FM1 SDK linking exception](LICENSE.md). The device engine is supplied as a binary SDK with separate terms. Retain the applicable [SDK terms, third-party licenses and contributor notices](THIRD_PARTY.md) when distributing builds.
+diff --git a/tools/ref/dx7core.c b/tools/ref/dx7core.c
+new file mode 100644
+index 0000000..ea67ede
+--- /dev/null
++++ b/tools/ref/dx7core.c
+@@ -0,0 +1,330 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * Copyright 2012, 2013 Google Inc.
++ * Modified for FM1 by M-VAVE, 2026: C port, fixed-point and block processing.
++ * Apache-2.0 terms and upstream revisions: THIRD_PARTY.md. */
++#include "engine.h"
++#include <stddef.h>
++#include <string.h>
++#include "dx7synth.h"
++#include "dx7core.h"
++
++enum { BIT_DEPTH = 14, ENV_MAX = 1 << BIT_DEPTH };
++enum FmOperatorFlags {
++    OUT_BUS_ONE = 1 << 0,
++    OUT_BUS_TWO = 1 << 1,
++    OUT_BUS_ADD = 1 << 2,
++    IN_BUS_ONE = 1 << 4,
++    IN_BUS_TWO = 1 << 5,
++    FB_IN = 1 << 6,
++    FB_OUT = 1 << 7
++};
++
++/* DX7 phase is a modulo-2^32 accumulator.  Spell the wrap in unsigned
++ * arithmetic so -Ofast cannot treat a signed overflow as unreachable. */
++FM1_DSP_CODE static inline int phase_add(int phase, int delta)
++{
++    return (int)((u32)phase + (u32)delta);
++}
++
++FM1_DSP_CODE static inline int phase_advance_block_64(int phase, int frequency)
++{
++    return (int)((u32)phase +
++                 (u32)frequency * (u32)SYNTH_DX7_BLOCK_SAMPLES);
++}
++
++
++static FM1_DSP_DATA const u8 algorithms[32][FM_OP_CNT] = {
++    { 0xc1, 0x11, 0x11, 0x14, 0x01, 0x14 }, // 1
++    { 0x01, 0x11, 0x11, 0x14, 0xc1, 0x14 }, // 2
++    { 0xc1, 0x11, 0x14, 0x01, 0x11, 0x14 }, // 3
++    { 0x41, 0x11, 0x94, 0x01, 0x11, 0x14 }, // 4
++    { 0xc1, 0x14, 0x01, 0x14, 0x01, 0x14 }, // 5
++    { 0x41, 0x94, 0x01, 0x14, 0x01, 0x14 }, // 6
++    { 0xc1, 0x11, 0x05, 0x14, 0x01, 0x14 }, // 7
++    { 0x01, 0x11, 0xc5, 0x14, 0x01, 0x14 }, // 8
++    { 0x01, 0x11, 0x05, 0x14, 0xc1, 0x14 }, // 9
++    { 0x01, 0x05, 0x14, 0xc1, 0x11, 0x14 }, // 10
++    { 0xc1, 0x05, 0x14, 0x01, 0x11, 0x14 }, // 11
++    { 0x01, 0x05, 0x05, 0x14, 0xc1, 0x14 }, // 12
++    { 0xc1, 0x05, 0x05, 0x14, 0x01, 0x14 }, // 13
++    { 0xc1, 0x05, 0x11, 0x14, 0x01, 0x14 }, // 14
++    { 0x01, 0x05, 0x11, 0x14, 0xc1, 0x14 }, // 15
++    { 0xc1, 0x11, 0x02, 0x25, 0x05, 0x14 }, // 16
++    { 0x01, 0x11, 0x02, 0x25, 0xc5, 0x14 }, // 17
++    { 0x01, 0x11, 0x11, 0xc5, 0x05, 0x14 }, // 18
++    { 0xc1, 0x14, 0x14, 0x01, 0x11, 0x14 }, // 19
++    { 0x01, 0x05, 0x14, 0xc1, 0x14, 0x14 }, // 20
++    { 0x01, 0x14, 0x14, 0xc1, 0x14, 0x14 }, // 21
++    { 0xc1, 0x14, 0x14, 0x14, 0x01, 0x14 }, // 22
++    { 0xc1, 0x14, 0x14, 0x01, 0x14, 0x04 }, // 23
++    { 0xc1, 0x14, 0x14, 0x14, 0x04, 0x04 }, // 24
++    { 0xc1, 0x14, 0x14, 0x04, 0x04, 0x04 }, // 25
++    { 0xc1, 0x05, 0x14, 0x01, 0x14, 0x04 }, // 26
++    { 0x01, 0x05, 0x14, 0xc1, 0x14, 0x04 }, // 27
++    { 0x04, 0xc1, 0x11, 0x14, 0x01, 0x14 }, // 28
++    { 0xc1, 0x14, 0x01, 0x14, 0x04, 0x04 }, // 29
++    { 0x04, 0xc1, 0x11, 0x14, 0x04, 0x04 }, // 30
++    { 0xc1, 0x14, 0x04, 0x04, 0x04, 0x04 }, // 31
++    { 0xc4, 0x04, 0x04, 0x04, 0x04, 0x04 }, // 32
++};
++
++FM1_DSP_CODE static void compute_fb4(int *output,t_dx7op_params *params,int gaincur, int gaindst,int *fb_buf, int feedback_shift)
++{
++    int dgain[3];
++    int gain[3];
++    int phase[3];
++    int y0 = fb_buf[0];
++    int y = fb_buf[1];
++
++    phase[0] = params[0].phase;
++    phase[1] = params[1].phase;
++    phase[2] = params[2].phase;
++
++    // gaincur 已是换算后的衰减域值(0=最响,ENV_MAX=静音)，0 为首块哨兵，从静音淡入；
++    // gaindst 是 dx7note 本块写入的原始包络，这里按主循环规则换算并写回
++    int g1_op1 = params[1].gaincur == 0 ? (ENV_MAX - 1) : params[1].gaincur;
++    int g2_op1 = ENV_MAX - (params[1].gaindst >> 14);
++    int g1_op2 = params[2].gaincur == 0 ? (ENV_MAX - 1) : params[2].gaincur;
++    int g2_op2 = ENV_MAX - (params[2].gaindst >> 14);
++    params[1].gaindst = g2_op1;
++    params[2].gaindst = g2_op2;
++
++    gain[0] = gaincur;
++    gain[1] = g1_op1;
++    gain[2] = g1_op2;
++
++    dgain[0] = (gaindst-gaincur+32)>>6;
++    dgain[1] = (g2_op1 - g1_op1 + 32) >> 6;
++    dgain[2] = (g2_op2 - g1_op2 + 32) >> 6;
++
++    for(int i = 0;i < 64; i++){
++        int scaled_fb = (y0 + y) >> (feedback_shift + 1);
++
++        // op 0
++        gain[0] += dgain[0];
++        y0 = y;
++        y = mk_sin(phase_add(phase[0], scaled_fb),gain[0]);
++        phase[0] = phase_add(phase[0], params[0].freq);
++
++        // op 1
++        gain[1] += dgain[1];
++        y = mk_sin(phase_add(phase[1], y),gain[1]);
++        phase[1] = phase_add(phase[1], params[1].freq);
++
++        // op 2
++        gain[2] += dgain[2];
++        y = mk_sin(phase_add(phase[2], y),gain[2]);
++        phase[2] = phase_add(phase[2], params[2].freq);
++
++        output[i] = y;
++
++    }
++    fb_buf[0] = y0;
++    fb_buf[1] = y;
++
++}
++
++FM1_DSP_CODE static void compute_fb6(int *output,t_dx7op_params *params,int gaincur, int gaindst,int *fb_buf, int feedback_shift)
++{
++    int dgain[2];
++    int gain[2];
++    int phase[2];
++    int y0 = fb_buf[0];
++    int y = fb_buf[1];
++
++    phase[0] = params[0].phase;
++    phase[1] = params[1].phase;
++
++
++    // gaincur 已是换算后的衰减域值(0=最响,ENV_MAX=静音)，0 为首块哨兵，从静音淡入；
++    // gaindst 是 dx7note 本块写入的原始包络，这里按主循环规则换算并写回
++    int g1_op1 = params[1].gaincur == 0 ? (ENV_MAX - 1) : params[1].gaincur;
++    int g2_op1 = ENV_MAX - (params[1].gaindst >> 14);
++    params[1].gaindst = g2_op1;
++
++    gain[0] = gaincur;
++    gain[1] = g1_op1;
++
++    dgain[0] = (gaindst-gaincur+32)>>6;
++    dgain[1] = (g2_op1 - g1_op1 + 32) >> 6;
++
++
++    for(int i = 0;i < 64; i++){
++        int scaled_fb = (y0 + y) >> (feedback_shift + 1);
++
++        // op 0
++        gain[0] += dgain[0];
++        y0 = y;
++        y = mk_sin(phase_add(phase[0], scaled_fb),gain[0]);
++        phase[0] = phase_add(phase[0], params[0].freq);
++
++        // op 1
++        gain[1] += dgain[1];
++        y = mk_sin(phase_add(phase[1], y),gain[1]);
++        phase[1] = phase_add(phase[1], params[1].freq);
++
++        output[i] = y;
++
++    }
++    fb_buf[0] = y0;
++    fb_buf[1] = y;
++
++}
++
++#define DX7_OPERATOR_WRAPPER static
++
++DX7_OPERATOR_WRAPPER void compute_64(int *output, const int *input,
++                                     int phase, int freq, int gaincur,
++                                     int gaindst, u8 add)
++{
++    int dgain = (gaindst - gaincur +
++                 (SYNTH_DX7_BLOCK_SAMPLES >> 1)) >> 6;
++    if (add) {
++      for (int i = 0; i < SYNTH_DX7_BLOCK_SAMPLES; i++) {
++        gaincur += dgain;
++        *output++ += mk_sin(phase_add(phase, *input++), gaincur);
++        phase = phase_add(phase, freq);
++      }
++    }
++    else {
++        for (int i = 0; i < SYNTH_DX7_BLOCK_SAMPLES; i++) {
++        gaincur += dgain;
++        *output++ = mk_sin(phase_add(phase, *input++), gaincur);
++        phase = phase_add(phase, freq);
++        }
++    }
++}
++
++DX7_OPERATOR_WRAPPER void compute_pure_64(int *output, int phase, int freq,
++                                          int gaincur, int gaindst, u8 add)
++{
++    int dgain = (gaindst - gaincur +
++                 (SYNTH_DX7_BLOCK_SAMPLES >> 1)) >> 6;
++    if (add) {
++        for (int i = 0; i < SYNTH_DX7_BLOCK_SAMPLES; i++) {
++            gaincur += dgain;
++            *output++ += (mk_sin(phase,gaincur));
++            phase = phase_add(phase, freq);
++        }
++    }
++    else {
++        for (int i = 0; i < SYNTH_DX7_BLOCK_SAMPLES; i++) {
++            gaincur += dgain;
++            *output++ = (mk_sin(phase,gaincur));
++            phase = phase_add(phase, freq);
++      }
++    }
++}
++DX7_OPERATOR_WRAPPER void compute_fb_64(int *output, int phase, int freq,
++                                        int gaincur, int gaindst,
++                                        int *fb_buf, int fb_shift, u8 add)
++{
++    int dgain = (gaindst - gaincur +
++                 (SYNTH_DX7_BLOCK_SAMPLES >> 1)) >> 6;
++    int y0 = fb_buf[0];
++    int y = fb_buf[1];
++    if (add) {
++        for (int i = 0; i < SYNTH_DX7_BLOCK_SAMPLES; i++) {
++            gaincur += dgain;
++            int scaled_fb = (y0 + y) >> (fb_shift+1);
++            y0 = y;
++            y = mk_sin(phase_add(phase, scaled_fb),gaincur);
++            *output++ += y;
++            phase = phase_add(phase, freq);
++        }
++    }
++    else {
++        for (int i = 0; i < SYNTH_DX7_BLOCK_SAMPLES; i++) {
++            gaincur += dgain;
++            int scaled_fb = (y0 + y) >> (fb_shift+1);
++            y0 = y;
++            y = mk_sin(phase_add(phase, scaled_fb),gaincur);
++            *output++ = y;
++            phase = phase_add(phase, freq);
++        }
++    }
++  fb_buf[0] = y0;
++  fb_buf[1] = y;
++}
++
++#undef DX7_OPERATOR_WRAPPER
++
++FM1_DSP_CODE void dx7core_compute_64(int *output, int *scratch, t_dx7op_params *params,
++                        int algorithm, int *fb_buf, int feedback_shift)
++{
++    const int kLevelThresh = ENV_MAX-100;
++    int *buf = scratch;
++    /* All three buses are guarded by has_contents.  A bus's first producer is
++     * forced to overwrite the full block, so the normal operator path needs no
++     * speculative clear.  If no carrier produces the final output at all, the
++     * block is cleared once after dispatch to avoid reusing a preceding block. */
++    u8  has_contents[3] = {0,0,0};
++    const u8 *alg;
++    bool fb_on = feedback_shift < 16;
++
++    algorithm &= 31;
++    alg = algorithms[algorithm];
++
++    for (int op = 0; op < FM_OP_CNT; op++) {
++        int flags = alg[op];
++        if (op == 0 && fb_on && (algorithm == 3 || algorithm == 5))
++            flags = 0xc4;
++        u8 add = (flags & OUT_BUS_ADD) != 0;
++        t_dx7op_params *param = &params[op];
++        int inbus = (flags >> 4) & 3;
++        int outbus = flags & 3;
++        int *outptr = (outbus == 0) ? output :
++                      buf + (outbus - 1) * SYNTH_DX7_BLOCK_SAMPLES;
++        int gain1 = param->gaincur ==0? (ENV_MAX - 1):param->gaincur;
++        int gain2 =ENV_MAX-(param->gaindst>>14);
++        param->gaindst = gain2;
++        if (gain1 <= kLevelThresh || gain2 <= kLevelThresh) {
++          if (!has_contents[outbus]) add = false;
++          if (inbus == 0 || !has_contents[inbus]) {
++            if ((flags & 0xc0) == 0xc0 && fb_on) {
++                switch(algorithm)
++                {
++                  case 3:
++                    compute_fb4(outptr,params,gain1,gain2,fb_buf,DSP_MIN(feedback_shift+2,16));
++                    params[1].phase = phase_advance_block_64(
++                        params[1].phase, params[1].freq);
++                    params[2].phase = phase_advance_block_64(
++                        params[2].phase, params[2].freq);
++                    op += 2;
++                    break;
++
++                  case 5:
++                    compute_fb6(outptr,params,gain1,gain2,fb_buf,DSP_MIN(feedback_shift+2,16));
++                    params[1].phase = phase_advance_block_64(
++                        params[1].phase, params[1].freq);
++                    op++;
++                    break;
++
++                  case 31:
++                    compute_fb_64(outptr, param->phase, param->freq, gain1,
++                                  gain2, fb_buf,
++                                  DSP_MIN(feedback_shift + 2, 16), add);
++                    break;
++                  default:
++                    compute_fb_64(outptr, param->phase, param->freq, gain1,
++                                  gain2, fb_buf, feedback_shift, add);
++                    break;
++                }
++            }
++            else compute_pure_64(outptr, param->phase, param->freq, gain1,
++                                 gain2, add);
++          }
++          else compute_64(outptr,
++                          buf + (inbus - 1) * SYNTH_DX7_BLOCK_SAMPLES,
++                          param->phase, param->freq, gain1, gain2, add);
++          has_contents[outbus] = true;
++        }
++        else if(!add) has_contents[outbus] = false;
++        param->phase = phase_advance_block_64(param->phase, param->freq);
++    }
++
++    if (!has_contents[0]) {
++        for (int i = 0; i < SYNTH_DX7_BLOCK_SAMPLES; ++i)
++            output[i] = 0;
++    }
++}
+diff --git a/tools/ref/dx7core.h b/tools/ref/dx7core.h
+new file mode 100644
+index 0000000..2d6c10d
+--- /dev/null
++++ b/tools/ref/dx7core.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: Apache-2.0
++ * Copyright 2012, 2013 Google Inc.
++ * Modified for FM1 by M-VAVE, 2026: C port, fixed-point and block processing.
++ * Apache-2.0 terms and upstream revisions: THIRD_PARTY.md. */
++#ifndef _DX7CORE_H_
++#define _DX7CORE_H_
++
++typedef struct  {
++  int gaincur;
++  int gaindst;
++  int freq;
++  int phase;
++}t_dx7op_params;
++
++void dx7core_compute_64(int *output, int *scratch, t_dx7op_params *params,
++                        int algorithm, int *fb_buf, int feedback_shift);
++
++#endif
+diff --git a/tools/test_opwaves.c b/tools/test_opwaves.c
+new file mode 100644
+index 0000000..ff436b9
+--- /dev/null
++++ b/tools/test_opwaves.c
+@@ -0,0 +1,157 @@
++/* SPDX-License-Identifier: GPL-3.0-only WITH GPL-3.0-linking-exception */
++/* Host test for the per-operator waveforms in the open web engine.
++ *
++ *   tools/test_opwaves.sh            (builds the frozen reference core in tools/ref)
++ *
++ * Checks: (1) wave 0 is bit-exact with mk_sin, (2) every wave keeps the sine's
++ * peak level and halves per attenuation octave, (3) harmonic content matches the
++ * shape, (4) with all waves = sine the whole core is bit-identical to the
++ * original dx7core across all 32 algorithms, and (5) modulated waves stay bounded. */
++#include "engine.h"
++#ifndef M_PI
++#define M_PI 3.14159265358979323846
++#endif
++#include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "dx7synth.h"
++#include "dx7core.h"
++
++/* Reference: the original core (frozen in tools/ref), compiled under another name. */
++void ref_dx7core_compute_64(int *output, int *scratch, t_dx7op_params *params,
++                            int algorithm, int *fb_buf, int feedback_shift);
++
++static int failures;
++#define CHECK(cond, ...) do { if (!(cond)) { ++failures; printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); } } while (0)
++
++static unsigned rng = 12345;
++static unsigned rnd(void) { rng = rng * 1664525U + 1013904223U; return rng >> 8; }
++
++static int peak(unsigned wave, unsigned short gain)
++{
++    int best = 0;
++    for (unsigned i = 0; i < 4096; ++i) {
++        int v = mk_wave((int)(i << 12), gain, wave);
++        if (abs(v) > best) best = abs(v);
++    }
++    return best;
++}
++
++/* Render one steady operator through the real core; return harmonic magnitudes. */
++static void spectrum(unsigned wave, double mag[33], double *dc)
++{
++    t_dx7op_params params[6];
++    int out[64], scratch[64 * 3], fb[2] = {0, 0};
++    u8 waves[6] = {0, 0, 0, 0, 0, 0};
++    waves[0] = (u8)wave;
++    memset(params, 0, sizeof params);
++    for (int block = 0; block < 4; ++block) {          /* settle, then measure */
++        for (int op = 0; op < 6; ++op) { params[op].gaincur = params[op].gaindst; }
++        params[0].gaindst = (1 << 28) - (8 << 14);     /* ~full level, nonzero */
++        params[0].freq = 0x00040000;                   /* 2^24 / 64: exactly 64 samples per cycle */
++        dx7core_compute_64(out, scratch, params, 31, fb, 16, waves);
++        if (block == 0) params[0].gaincur = 8;
++    }
++    for (int k = 0; k <= 32; ++k) {
++        double re = 0, im = 0;
++        for (int n = 0; n < 64; ++n) {
++            double a = 2.0 * M_PI * k * n / 64.0;
++            re += out[n] * cos(a);
++            im -= out[n] * sin(a);
++        }
++        mag[k] = sqrt(re * re + im * im) / 32.0;
++    }
++    *dc = mag[0] / 2.0;
++}
++
++int main(void)
++{
++    /* 1. wave 0 == mk_sin */
++    for (unsigned i = 0; i < 20000; ++i) {
++        int phase = (int)(rnd() << 8 ^ rnd());
++        unsigned short gain = (unsigned short)(rnd() & 0x3fff);
++        CHECK(mk_wave(phase, gain, 0) == mk_sin(phase, gain), "wave0 != sine");
++    }
++
++    /* 2. peak level and attenuation */
++    int ref = peak(0, 0);
++    for (unsigned w = 1; w < DX7_WAVE_COUNT; ++w) {
++        int p0 = peak(w, 0), p1 = peak(w, 1024);
++        double rel = (double)p0 / ref, oct = (double)p1 / p0;
++        printf("wave %u: peak %.3f of sine, one octave of attenuation -> %.3f\n", w, rel, oct);
++        CHECK(rel > 0.95 && rel < 1.01, "wave %u peak %.3f", w, rel);
++        CHECK(oct > 0.48 && oct < 0.52, "wave %u octave ratio %.3f", w, oct);
++    }
++
++    /* 3. harmonic content through the real core */
++    double m[33], dc;
++    spectrum(DX7_WAVE_SINE, m, &dc);
++    CHECK(m[1] > 1000 * m[2] && m[1] > 1000 * m[3], "sine not pure");
++    spectrum(DX7_WAVE_SAW, m, &dc);
++    printf("saw: H2/H1=%.3f H3/H1=%.3f\n", m[2] / m[1], m[3] / m[1]);
++    CHECK(fabs(m[2] / m[1] - 0.5) < 0.05 && fabs(m[3] / m[1] - 1.0 / 3) < 0.05, "saw harmonics");
++    spectrum(DX7_WAVE_SQUARE, m, &dc);
++    printf("square: H2/H1=%.3f H3/H1=%.3f\n", m[2] / m[1], m[3] / m[1]);
++    CHECK(m[2] / m[1] < 0.02 && fabs(m[3] / m[1] - 1.0 / 3) < 0.05, "square harmonics");
++    spectrum(DX7_WAVE_TRIANGLE, m, &dc);
++    printf("triangle: H2/H1=%.3f H3/H1=%.3f\n", m[2] / m[1], m[3] / m[1]);
++    CHECK(m[2] / m[1] < 0.02 && fabs(m[3] / m[1] - 1.0 / 9) < 0.02, "triangle harmonics");
++    spectrum(DX7_WAVE_HALF_SINE, m, &dc);
++    printf("half sine: H2/H1=%.3f\n", m[2] / m[1]);
++    CHECK(fabs(m[2] / m[1] - 0.4244) < 0.05, "half-sine harmonics");
++    spectrum(DX7_WAVE_FULL_SINE, m, &dc);
++    printf("full sine: H1/H2=%.4f\n", m[1] / m[2]);
++    CHECK(m[1] / m[2] < 0.02, "full-wave sine keeps a fundamental");
++
++    /* 4. all-sine core is bit-identical to the original, every algorithm */
++    unsigned compared = 0;
++    for (int alg = 0; alg < 32; ++alg) {
++        for (int trial = 0; trial < 40; ++trial) {
++            t_dx7op_params a[6], b[6];
++            int oa[64], ob[64], sa[192], sb[192], fa[2] = {0, 0}, fb[2] = {0, 0};
++            u8 waves[6] = {0, 0, 0, 0, 0, 0};
++            int shift = (rnd() & 1) ? 16 : (int)(rnd() % 8);
++            for (int op = 0; op < 6; ++op) {
++                a[op].gaincur = (int)(rnd() % 16000) + 1;
++                a[op].gaindst = (int)(rnd() % (1 << 28));
++                a[op].freq = (int)(rnd() << 8 ^ rnd()) >> 3;
++                a[op].phase = (int)(rnd() << 8 ^ rnd());
++                b[op] = a[op];
++            }
++            for (int blk = 0; blk < 3; ++blk) {
++                dx7core_compute_64(oa, sa, a, alg, fa, shift, waves);
++                ref_dx7core_compute_64(ob, sb, b, alg, fb, shift);
++                CHECK(memcmp(oa, ob, sizeof oa) == 0, "alg %d trial %d block %d differs", alg + 1, trial, blk);
++                CHECK(memcmp(a, b, sizeof a) == 0 && memcmp(fa, fb, sizeof fa) == 0,
++                      "alg %d state differs", alg + 1);
++                ++compared;
++            }
++        }
++    }
++    printf("bit-exact blocks vs original core: %u\n", compared);
++
++    /* 5. modulated non-sine waves stay finite and move with the modulator */
++    for (unsigned w = 1; w < DX7_WAVE_COUNT; ++w) {
++        t_dx7op_params p[6];
++        int o1[64], o2[64], s[192], fb[2] = {0, 0};
++        u8 waves[6] = {(u8)w, (u8)w, 0, 0, 0, 0};
++        memset(p, 0, sizeof p);
++        for (int op = 0; op < 2; ++op) { p[op].gaincur = 8; p[op].gaindst = (1 << 28) - (8 << 14); }
++        p[0].freq = 0x00040000; p[1].freq = 0x00040000 * 2;
++        dx7core_compute_64(o1, s, p, 4, fb, 16, waves);        /* alg 5: op0 -> op1 */
++        memset(p, 0, sizeof p);
++        for (int op = 0; op < 2; ++op) { p[op].gaincur = 8; p[op].gaindst = (1 << 28) - (8 << 14); }
++        p[0].freq = 0x00040000; p[1].freq = 0x00040000 * 2;
++        memset(fb, 0, sizeof fb);
++        waves[0] = 0;                                          /* different modulator shape */
++        dx7core_compute_64(o2, s, p, 4, fb, 16, waves);
++        int differ = 0, big = 0;
++        for (int i = 0; i < 64; ++i) { differ |= o1[i] != o2[i]; if (abs(o1[i]) > (1 << 27)) big = 1; }
++        CHECK(differ, "wave %u: modulator shape has no effect", w);
++        CHECK(!big, "wave %u: output exceeds range", w);
++    }
++
++    printf(failures ? "\n%d FAILURE(S)\n" : "\nall checks passed\n", failures);
++    return failures != 0;
++}
+diff --git a/tools/test_opwaves.sh b/tools/test_opwaves.sh
+new file mode 100755
+index 0000000..3c004c9
+--- /dev/null
++++ b/tools/test_opwaves.sh
+@@ -0,0 +1,21 @@
++#!/bin/sh
++# SPDX-License-Identifier: GPL-3.0-only WITH GPL-3.0-linking-exception
++# Build and run the operator-waveform host tests (Linux/macOS, needs clang + git).
++# The reference core is a frozen copy of the original web/synth/dx7core.c (tools/ref).
++set -e
++root=$(cd "$(dirname "$0")/.." && pwd)
++tmp=$(mktemp -d)
++trap 'rm -rf "$tmp"' EXIT
++inc="-I$root/web/synth -I$root/third_party/synth -I$root/sdk/include -I$root/app/synth -I$root/app"
++common="-std=c11 -O2 -fwrapv -fno-fast-math -ffp-contract=off -DFM1_HOST_TEST -DFM1_OPEN_WEB -Wall -Wextra -Werror -Wno-unused-function -Wno-array-parameter"
++# -iquote puts the reference header ahead of the live one for that file only.
++clang $common -iquote "$root/tools/ref" $inc -Ddx7core_compute_64=ref_dx7core_compute_64 \
++    -c "$root/tools/ref/dx7core.c" -o "$tmp/ref.o"
++clang $common $inc "$root/tools/test_opwaves.c" "$root/web/synth/dx7core.c" \
++    "$root/web/synth/dx7math.c" "$root/web/synth/fixed.c" "$tmp/ref.o" -lm -o "$tmp/test"
++"$tmp/test"
++echo
++echo "== end-to-end: full web engine through the simulator exports =="
++srcs=$(git -C "$root" ls-files 'web/*.c' 'third_party/synth/*.c' 'app/*.c' | grep -v '^app/board/' | sed "s|^|$root/|")
++clang $common $inc "$root/tools/test_sim_wave.c" $srcs -lm -o "$tmp/sim_test"
++"$tmp/sim_test"
+diff --git a/tools/test_sim_wave.c b/tools/test_sim_wave.c
+new file mode 100644
+index 0000000..22bb125
+--- /dev/null
++++ b/tools/test_sim_wave.c
+@@ -0,0 +1,81 @@
++/* SPDX-License-Identifier: GPL-3.0-only WITH GPL-3.0-linking-exception */
++/* End-to-end host test: drives the full open web engine through its simulator
++ * exports, plays a note on the DX7 track and checks the sim_op_wave control. */
++#include <math.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++extern void sim_boot(unsigned clear);
++extern int sim_select(unsigned track, unsigned source);
++extern int sim_op_wave(unsigned track, unsigned op, int wave);
++extern uint8_t *sim_file(void);
++extern int sim_midi(unsigned bytes);
++extern const float *sim_render(void);
++extern unsigned sim_block_frames(void);
++
++enum { BLOCKS = 220 };
++static int failures;
++#define CHECK(cond, ...) do { if (!(cond)) { ++failures; printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); } } while (0)
++
++/* Render ~0.6 s of a held middle C. Waves: -1 leaves the engine untouched. */
++static void run(int wave, float *out)
++{
++    unsigned frames = sim_block_frames();
++    sim_boot(1 | 2);
++    CHECK(sim_select(0, 0) == 0, "select DX7 track");
++    if (wave >= 0)
++        for (unsigned op = 0; op < 6; ++op)
++            CHECK(sim_op_wave(0, op, wave) == 0, "set op %u wave %d", op, wave);
++    uint8_t *m = sim_file();
++    m[0] = 0x90; m[1] = 60; m[2] = 110;
++    CHECK(sim_midi(3) == 0, "note on");
++    for (unsigned b = 0; b < BLOCKS; ++b) {
++        const float *block = sim_render();
++        for (unsigned i = 0; i < frames; ++i) out[b * frames + i] = block[i * 2];
++    }
++}
++
++static double rms(const float *x, unsigned n)
++{
++    double s = 0;
++    for (unsigned i = 0; i < n; ++i) s += (double)x[i] * x[i];
++    return sqrt(s / n);
++}
++
++int main(void)
++{
++    static float baseline[BLOCKS * 256], saw[BLOCKS * 256], square[BLOCKS * 256], again[BLOCKS * 256];
++    unsigned n = BLOCKS * sim_block_frames();
++    run(-1, baseline);
++    run(2, saw);
++    run(3, square);
++    run(0, again);
++
++    double rb = rms(baseline, n), rs = rms(saw, n), rq = rms(square, n);
++    printf("rms: baseline %.4f  saw %.4f  square %.4f\n", rb, rs, rq);
++    CHECK(rb > 1e-4, "baseline is silent");
++    CHECK(rs > 1e-4 && rq > 1e-4, "alternate waves are silent");
++
++    unsigned same = 0;
++    for (unsigned i = 0; i < n; ++i) same += baseline[i] == again[i];
++    CHECK(same == n, "setting waves back to sine is not bit-identical (%u/%u)", same, n);
++
++    unsigned diff = 0;
++    float peak = 0;
++    for (unsigned i = 0; i < n; ++i) {
++        diff += baseline[i] != saw[i];
++        if (fabsf(saw[i]) > peak) peak = fabsf(saw[i]);
++        if (fabsf(square[i]) > peak) peak = fabsf(square[i]);
++    }
++    CHECK(diff > n / 2, "saw barely differs from sine (%u/%u)", diff, n);
++    CHECK(peak < 1.5f, "output peak %.2f", peak);
++    CHECK(sim_op_wave(0, 6, 1) < 0 && sim_op_wave(0, 0, 99) < 0 && sim_op_wave(9, 0, 1) < 0, "bad arguments accepted");
++
++    sim_boot(1 | 2);
++    sim_select(0, 0);
++    CHECK(sim_op_wave(0, 2, 4) == 0 && sim_op_wave(0, 2, -1) == 4, "wave readback");
++
++    printf(failures ? "\n%d FAILURE(S)\n" : "\nall checks passed\n", failures);
++    return failures != 0;
++}
+diff --git a/web/engine/Simulator.c b/web/engine/Simulator.c
+index da571f2..bfe07a5 100644
+--- a/web/engine/Simulator.c
++++ b/web/engine/Simulator.c
+@@ -260,6 +260,10 @@ EXPORT("sim_clear") void sim_clear(void)
+     sim_boot(0);
+     sim_control(3, 0, (int)level);
+ }
++EXPORT("sim_op_wave") int sim_op_wave(unsigned track, unsigned op, int wave)
++{
++    return wave < 0 ? groove_fm_wave_get(track, op) : groove_fm_wave_set(track, op, (unsigned)wave);
++}
+ EXPORT("sim_panic") void sim_panic(void)
+ {
+     sim_release(); midi_read = midi_write = midi_reset = 0;
+diff --git a/web/engine/internal.h b/web/engine/internal.h
+index a7ad85b..9f63cbc 100644
+--- a/web/engine/internal.h
++++ b/web/engine/internal.h
+@@ -26,4 +26,9 @@ FM1_DSP_CODE void groove_edit_midi_changed(void);
+ FM1_DSP_CODE void groove_sequence_click(int32_t *output, unsigned frames);
+ FM1_DSP_CODE void groove_lock_apply(unsigned track, unsigned parameter, unsigned value);
+ FM1_DSP_CODE void groove_lock_restore(unsigned track);
++/* Open web engine only: per-operator waveform on a DX7 track. op is the
++ * panel's OP1..OP6 (the engine stores them in reverse); wave 0..5. Live timbre
++ * state: kept until the source is reset, not stored in projects. Returns 0 or <0. */
++int groove_fm_wave_set(unsigned track, unsigned op, unsigned wave);
++int groove_fm_wave_get(unsigned track, unsigned op);
+ #endif
+diff --git a/web/engine/sound.c b/web/engine/sound.c
+index 8d22009..05f7960 100644
+--- a/web/engine/sound.c
++++ b/web/engine/sound.c
+@@ -2,6 +2,7 @@
+ /* Modified 2026-10-17: retain undo history when voice allocation fails. */
+ #include "engine.h"
+ #include "synth_dx7.h"
++#include "dx7math.h"
+ #include "bass303.h"
+ #include "drum808.h"
+ #include "psg.h"
+@@ -1706,6 +1707,21 @@ __attribute__((cold, minsize)) void groove_mono_set(unsigned track, unsigned mon
+     }
+     fm1_web_resume();
+ }
++int groove_fm_wave_set(unsigned track, unsigned op, unsigned wave)
++{
++    if (track >= GROOVE_TRACKS || op >= 6 || wave >= DX7_WAVE_COUNT) return -1;
++    if (groove_source_type(track) != GROOVE_DX7 || !sources[track].fm) return -1;
++    fm1_web_pause();
++    synth_dx7_set_operator_wave(sources[track].fm, (uint8_t)(5U - op), (uint8_t)wave);
++    fm1_web_resume();
++    return 0;
++}
++int groove_fm_wave_get(unsigned track, unsigned op)
++{
++    if (track >= GROOVE_TRACKS || op >= 6) return -1;
++    if (groove_source_type(track) != GROOVE_DX7 || !sources[track].fm) return -1;
++    return synth_dx7_get_operator_wave(sources[track].fm, (uint8_t)(5U - op));
++}
+ static FM1_DSP_DATA const uint8_t drum_notes[GROOVE_DRUMS] = {36, 38, 41, 45, 48, 37,
+                                                               39, 56, 49, 46, 42};
+ FM1_DSP_CODE unsigned groove_drum_note(unsigned drum) { return drum_notes[drum % GROOVE_DRUMS]; }
+diff --git a/web/synth/dx7core.c b/web/synth/dx7core.c
+index ea67ede..6133bd1 100644
+--- a/web/synth/dx7core.c
++++ b/web/synth/dx7core.c
+@@ -32,6 +32,13 @@ FM1_DSP_CODE static inline int phase_advance_block_64(int phase, int frequency)
+                  (u32)frequency * (u32)SYNTH_DX7_BLOCK_SAMPLES);
+ }
+ 
++/* Wave 0 stays on the original sine fast path. */
++FM1_DSP_CODE static inline int op_out(int phase, int gain, u8 wave)
++{
++    return wave ? mk_wave(phase, (unsigned short)gain, wave)
++                : mk_sin(phase, (unsigned short)gain);
++}
++
+ 
+ static FM1_DSP_DATA const u8 algorithms[32][FM_OP_CNT] = {
+     { 0xc1, 0x11, 0x11, 0x14, 0x01, 0x14 }, // 1
+@@ -68,7 +75,7 @@ static FM1_DSP_DATA const u8 algorithms[32][FM_OP_CNT] = {
+     { 0xc4, 0x04, 0x04, 0x04, 0x04, 0x04 }, // 32
+ };
+ 
+-FM1_DSP_CODE static void compute_fb4(int *output,t_dx7op_params *params,int gaincur, int gaindst,int *fb_buf, int feedback_shift)
++FM1_DSP_CODE static void compute_fb4(int *output,t_dx7op_params *params,int gaincur, int gaindst,int *fb_buf, int feedback_shift, const u8 *wave)
+ {
+     int dgain[3];
+     int gain[3];
+@@ -103,17 +110,17 @@ FM1_DSP_CODE static void compute_fb4(int *output,t_dx7op_params *params,int gain
+         // op 0
+         gain[0] += dgain[0];
+         y0 = y;
+-        y = mk_sin(phase_add(phase[0], scaled_fb),gain[0]);
++        y = op_out(phase_add(phase[0], scaled_fb),gain[0],wave[0]);
+         phase[0] = phase_add(phase[0], params[0].freq);
+ 
+         // op 1
+         gain[1] += dgain[1];
+-        y = mk_sin(phase_add(phase[1], y),gain[1]);
++        y = op_out(phase_add(phase[1], y),gain[1],wave[1]);
+         phase[1] = phase_add(phase[1], params[1].freq);
+ 
+         // op 2
+         gain[2] += dgain[2];
+-        y = mk_sin(phase_add(phase[2], y),gain[2]);
++        y = op_out(phase_add(phase[2], y),gain[2],wave[2]);
+         phase[2] = phase_add(phase[2], params[2].freq);
+ 
+         output[i] = y;
+@@ -124,7 +131,7 @@ FM1_DSP_CODE static void compute_fb4(int *output,t_dx7op_params *params,int gain
+ 
+ }
+ 
+-FM1_DSP_CODE static void compute_fb6(int *output,t_dx7op_params *params,int gaincur, int gaindst,int *fb_buf, int feedback_shift)
++FM1_DSP_CODE static void compute_fb6(int *output,t_dx7op_params *params,int gaincur, int gaindst,int *fb_buf, int feedback_shift, const u8 *wave)
+ {
+     int dgain[2];
+     int gain[2];
+@@ -155,12 +162,12 @@ FM1_DSP_CODE static void compute_fb6(int *output,t_dx7op_params *params,int gain
+         // op 0
+         gain[0] += dgain[0];
+         y0 = y;
+-        y = mk_sin(phase_add(phase[0], scaled_fb),gain[0]);
++        y = op_out(phase_add(phase[0], scaled_fb),gain[0],wave[0]);
+         phase[0] = phase_add(phase[0], params[0].freq);
+ 
+         // op 1
+         gain[1] += dgain[1];
+-        y = mk_sin(phase_add(phase[1], y),gain[1]);
++        y = op_out(phase_add(phase[1], y),gain[1],wave[1]);
+         phase[1] = phase_add(phase[1], params[1].freq);
+ 
+         output[i] = y;
+@@ -175,49 +182,49 @@ FM1_DSP_CODE static void compute_fb6(int *output,t_dx7op_params *params,int gain
+ 
+ DX7_OPERATOR_WRAPPER void compute_64(int *output, const int *input,
+                                      int phase, int freq, int gaincur,
+-                                     int gaindst, u8 add)
++                                     int gaindst, u8 add, u8 wave)
+ {
+     int dgain = (gaindst - gaincur +
+                  (SYNTH_DX7_BLOCK_SAMPLES >> 1)) >> 6;
+     if (add) {
+       for (int i = 0; i < SYNTH_DX7_BLOCK_SAMPLES; i++) {
+         gaincur += dgain;
+-        *output++ += mk_sin(phase_add(phase, *input++), gaincur);
++        *output++ += op_out(phase_add(phase, *input++), gaincur, wave);
+         phase = phase_add(phase, freq);
+       }
+     }
+     else {
+         for (int i = 0; i < SYNTH_DX7_BLOCK_SAMPLES; i++) {
+         gaincur += dgain;
+-        *output++ = mk_sin(phase_add(phase, *input++), gaincur);
++        *output++ = op_out(phase_add(phase, *input++), gaincur, wave);
+         phase = phase_add(phase, freq);
+         }
+     }
+ }
+ 
+ DX7_OPERATOR_WRAPPER void compute_pure_64(int *output, int phase, int freq,
+-                                          int gaincur, int gaindst, u8 add)
++                                          int gaincur, int gaindst, u8 add, u8 wave)
+ {
+     int dgain = (gaindst - gaincur +
+                  (SYNTH_DX7_BLOCK_SAMPLES >> 1)) >> 6;
+     if (add) {
+         for (int i = 0; i < SYNTH_DX7_BLOCK_SAMPLES; i++) {
+             gaincur += dgain;
+-            *output++ += (mk_sin(phase,gaincur));
++            *output++ += op_out(phase, gaincur, wave);
+             phase = phase_add(phase, freq);
+         }
+     }
+     else {
+         for (int i = 0; i < SYNTH_DX7_BLOCK_SAMPLES; i++) {
+             gaincur += dgain;
+-            *output++ = (mk_sin(phase,gaincur));
++            *output++ = op_out(phase, gaincur, wave);
+             phase = phase_add(phase, freq);
+       }
+     }
+ }
+ DX7_OPERATOR_WRAPPER void compute_fb_64(int *output, int phase, int freq,
+                                         int gaincur, int gaindst,
+-                                        int *fb_buf, int fb_shift, u8 add)
++                                        int *fb_buf, int fb_shift, u8 add, u8 wave)
+ {
+     int dgain = (gaindst - gaincur +
+                  (SYNTH_DX7_BLOCK_SAMPLES >> 1)) >> 6;
+@@ -228,7 +235,7 @@ DX7_OPERATOR_WRAPPER void compute_fb_64(int *output, int phase, int freq,
+             gaincur += dgain;
+             int scaled_fb = (y0 + y) >> (fb_shift+1);
+             y0 = y;
+-            y = mk_sin(phase_add(phase, scaled_fb),gaincur);
++            y = op_out(phase_add(phase, scaled_fb), gaincur, wave);
+             *output++ += y;
+             phase = phase_add(phase, freq);
+         }
+@@ -238,7 +245,7 @@ DX7_OPERATOR_WRAPPER void compute_fb_64(int *output, int phase, int freq,
+             gaincur += dgain;
+             int scaled_fb = (y0 + y) >> (fb_shift+1);
+             y0 = y;
+-            y = mk_sin(phase_add(phase, scaled_fb),gaincur);
++            y = op_out(phase_add(phase, scaled_fb), gaincur, wave);
+             *output++ = y;
+             phase = phase_add(phase, freq);
+         }
+@@ -250,7 +257,8 @@ DX7_OPERATOR_WRAPPER void compute_fb_64(int *output, int phase, int freq,
+ #undef DX7_OPERATOR_WRAPPER
+ 
+ FM1_DSP_CODE void dx7core_compute_64(int *output, int *scratch, t_dx7op_params *params,
+-                        int algorithm, int *fb_buf, int feedback_shift)
++                        int algorithm, int *fb_buf, int feedback_shift,
++                        const u8 *wave)
+ {
+     const int kLevelThresh = ENV_MAX-100;
+     int *buf = scratch;
+@@ -285,7 +293,7 @@ FM1_DSP_CODE void dx7core_compute_64(int *output, int *scratch, t_dx7op_params *
+                 switch(algorithm)
+                 {
+                   case 3:
+-                    compute_fb4(outptr,params,gain1,gain2,fb_buf,DSP_MIN(feedback_shift+2,16));
++                    compute_fb4(outptr,params,gain1,gain2,fb_buf,DSP_MIN(feedback_shift+2,16),wave);
+                     params[1].phase = phase_advance_block_64(
+                         params[1].phase, params[1].freq);
+                     params[2].phase = phase_advance_block_64(
+@@ -294,7 +302,7 @@ FM1_DSP_CODE void dx7core_compute_64(int *output, int *scratch, t_dx7op_params *
+                     break;
+ 
+                   case 5:
+-                    compute_fb6(outptr,params,gain1,gain2,fb_buf,DSP_MIN(feedback_shift+2,16));
++                    compute_fb6(outptr,params,gain1,gain2,fb_buf,DSP_MIN(feedback_shift+2,16),wave);
+                     params[1].phase = phase_advance_block_64(
+                         params[1].phase, params[1].freq);
+                     op++;
+@@ -303,20 +311,20 @@ FM1_DSP_CODE void dx7core_compute_64(int *output, int *scratch, t_dx7op_params *
+                   case 31:
+                     compute_fb_64(outptr, param->phase, param->freq, gain1,
+                                   gain2, fb_buf,
+-                                  DSP_MIN(feedback_shift + 2, 16), add);
++                                  DSP_MIN(feedback_shift + 2, 16), add, wave[op]);
+                     break;
+                   default:
+                     compute_fb_64(outptr, param->phase, param->freq, gain1,
+-                                  gain2, fb_buf, feedback_shift, add);
++                                  gain2, fb_buf, feedback_shift, add, wave[op]);
+                     break;
+                 }
+             }
+             else compute_pure_64(outptr, param->phase, param->freq, gain1,
+-                                 gain2, add);
++                                 gain2, add, wave[op]);
+           }
+           else compute_64(outptr,
+                           buf + (inbus - 1) * SYNTH_DX7_BLOCK_SAMPLES,
+-                          param->phase, param->freq, gain1, gain2, add);
++                          param->phase, param->freq, gain1, gain2, add, wave[op]);
+           has_contents[outbus] = true;
+         }
+         else if(!add) has_contents[outbus] = false;
+diff --git a/web/synth/dx7core.h b/web/synth/dx7core.h
+index 2d6c10d..56bb3a2 100644
+--- a/web/synth/dx7core.h
++++ b/web/synth/dx7core.h
+@@ -13,6 +13,7 @@ typedef struct  {
+ }t_dx7op_params;
+ 
+ void dx7core_compute_64(int *output, int *scratch, t_dx7op_params *params,
+-                        int algorithm, int *fb_buf, int feedback_shift);
++                        int algorithm, int *fb_buf, int feedback_shift,
++                        const u8 *wave /* [FM_OP_CNT], DX7_WAVE_* */);
+ 
+ #endif
+diff --git a/web/synth/dx7ctrl.h b/web/synth/dx7ctrl.h
+index cfac261..c8b816a 100644
+--- a/web/synth/dx7ctrl.h
++++ b/web/synth/dx7ctrl.h
+@@ -37,6 +37,7 @@ typedef struct
+    ctrl_mod breath;
+    ctrl_mod aftertouch;
+    u8  opswitch;
++   u8  opwave[6];   /* Per-operator waveform (DX7_WAVE_*), 0 = sine. */
+ }t_dx7ctrl;
+ 
+ #endif
+diff --git a/web/synth/dx7math.c b/web/synth/dx7math.c
+index 3733b47..36b1ccd 100644
+--- a/web/synth/dx7math.c
++++ b/web/synth/dx7math.c
+@@ -1064,3 +1064,46 @@ FM1_DSP_CODE int mk_sin(int phase,unsigned short gain)
+     /* Multiplication avoids the undefined left shift of a negative value. */
+     return isSigned ? -((int)result + 1) * 8192 : (int)result * 8192;
+ }
++
++/* Alternate operator waveforms (opsix-style). The shape is built as a signed
++ * 13-bit sample, then scaled by the same log-domain attenuation mk_sin() uses,
++ * so envelope curves and modulation depth behave identically. Hard-edged
++ * shapes are not band-limited and alias at high pitches, like a naive oscillator. */
++FM1_DSP_CODE int mk_wave(int phase, unsigned short gain, unsigned wave)
++{
++    /* One cycle is 2^24 phase units (mk_sin reads bits 12..23), so move the
++     * cycle to the top of the word; the shapes below treat it as 2^32. */
++    const u32 p = (u32)phase << 8;
++    int shape;
++
++    switch (wave) {
++    case DX7_WAVE_TRIANGLE: {
++        /* Quarter-cycle offset so the wave starts at zero and rises, like sine. */
++        const int q = (int)(p + 0x40000000U) >> 17;
++        shape = (q < 0 ? -q : q) - 8192;
++        break;
++    }
++    case DX7_WAVE_SAW:
++        shape = (int)p >> 18;
++        break;
++    case DX7_WAVE_SQUARE:
++        shape = (int)p < 0 ? -8191 : 8191;
++        break;
++    case DX7_WAVE_HALF_SINE:
++    case DX7_WAVE_FULL_SINE: {
++        shape = mk_sin(phase, 0) / 8192;
++        if (shape < 0)
++            shape = wave == DX7_WAVE_HALF_SINE ? 0 : -shape;
++        break;
++    }
++    default:
++        return mk_sin(phase, gain);
++    }
++    if (shape > 8191) shape = 8191;
++    if (shape < -8191) shape = -8191;
++
++    const unsigned expVal = gain & 0x7fffU;
++    const int attenuation = (int)((4096U +
++        dx7_sin_exp_table[(expVal & 0x3ffU) ^ 0x3ffU]) >> (expVal >> 10));
++    return shape * attenuation;
++}
+diff --git a/web/synth/dx7math.h b/web/synth/dx7math.h
+index 1ab1eca..1119a7d 100644
+--- a/web/synth/dx7math.h
++++ b/web/synth/dx7math.h
+@@ -11,4 +11,18 @@ void freq_lut_release(void);
+ int freqlut_qx(int logfreq);
+ int k_log2_q24(unsigned int x);
+ int mk_sin(int phase,unsigned short gain);
++
++/* Operator waveforms. Wave 0 is the original DX7 sine and is bit-exact with
++ * mk_sin(); the others share its phase convention, attenuation domain and
++ * peak level, so they drop into any algorithm unchanged. */
++enum {
++    DX7_WAVE_SINE,
++    DX7_WAVE_TRIANGLE,
++    DX7_WAVE_SAW,
++    DX7_WAVE_SQUARE,
++    DX7_WAVE_HALF_SINE,
++    DX7_WAVE_FULL_SINE,
++    DX7_WAVE_COUNT
++};
++int mk_wave(int phase, unsigned short gain, unsigned wave);
+ #endif
+diff --git a/web/synth/dx7note.c b/web/synth/dx7note.c
+index 292d532..d783222 100644
+--- a/web/synth/dx7note.c
++++ b/web/synth/dx7note.c
+@@ -236,7 +236,7 @@ FM1_DSP_CODE void dx7note_compute_64(t_dx7note *this, int *buf, int *scratch, in
+     }
+   this->freq_valid |= ctrl->opswitch;
+   dx7core_compute_64(buf, scratch, this->params, this->algorithm,
+-                     this->fb_buf, this->fb_shift);
++                     this->fb_buf, this->fb_shift, ctrl->opwave);
+ }
+ 
+ FM1_DSP_CODE void dx7note_keyup(t_dx7note *this)
+diff --git a/web/synth/dx7synth.c b/web/synth/dx7synth.c
+index 69af972..f3795fc 100644
+--- a/web/synth/dx7synth.c
++++ b/web/synth/dx7synth.c
+@@ -150,6 +150,7 @@ static void init_instance(t_dx7synth *this, void *allocation,
+     this->sustain = 0;
+     this->ctrl.pitchbend = 0x2000;
+     this->ctrl.opswitch = 0x3f;
++    memset(this->ctrl.opwave, DX7_WAVE_SINE, sizeof this->ctrl.opwave);
+     this->ctrl.pitchrange = 12;
+     this->ctrl.pitchrangeup = 12;
+     this->ctrl.pitchrangedn = 12;
+@@ -650,6 +651,23 @@ FM1_DSP_CODE void synth_dx7_set_operator_mask(synth_dx7_t *handle, uint8_t mask)
+     this->ctrl.opswitch = mask & 0x3f;
+ }
+ 
++/* Per-operator waveform, op 0..5 in engine (VCED) order, wave DX7_WAVE_*.
++ * Out-of-range arguments are ignored. Takes effect on the next control block. */
++FM1_DSP_CODE void synth_dx7_set_operator_wave(synth_dx7_t *handle, uint8_t op,
++                                              uint8_t wave)
++{
++    t_dx7synth *this = handle;
++    if (this == NULL || op >= FM_OP_CNT || wave >= DX7_WAVE_COUNT) return;
++    this->ctrl.opwave[op] = wave;
++}
++
++FM1_DSP_CODE uint8_t synth_dx7_get_operator_wave(const synth_dx7_t *handle,
++                                                 uint8_t op)
++{
++    const t_dx7synth *this = handle;
++    return (this == NULL || op >= FM_OP_CNT) ? 0U : this->ctrl.opwave[op];
++}
++
+ FM1_DSP_CODE void synth_dx7_set_adsr(synth_dx7_t *handle, uint8_t enabled,
+                         uint8_t attack, uint8_t decay,
+                         uint8_t sustain, uint8_t release)
+diff --git a/web/synth/synth_dx7.h b/web/synth/synth_dx7.h
+index c91aa36..f2fa6c0 100644
+--- a/web/synth/synth_dx7.h
++++ b/web/synth/synth_dx7.h
+@@ -65,6 +65,10 @@ void synth_dx7_set_glide(synth_dx7_t *synth,
+                          uint8_t amount,
+                          uint8_t fingered);
+ void synth_dx7_set_operator_mask(synth_dx7_t *synth, uint8_t mask);
++/* Open web engine only. op 0..5 in engine (VCED) order; wave 0..5 selects
++ * sine, triangle, saw, square, half-wave sine or full-wave sine. */
++void synth_dx7_set_operator_wave(synth_dx7_t *synth, uint8_t op, uint8_t wave);
++uint8_t synth_dx7_get_operator_wave(const synth_dx7_t *synth, uint8_t op);
+ void synth_dx7_set_adsr(synth_dx7_t *synth,
+                         uint8_t enabled,
+                         uint8_t attack,
